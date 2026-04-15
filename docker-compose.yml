@@ -27,6 +27,11 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:29092"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
 
   producer:
     build:
@@ -34,11 +39,28 @@ services:
       dockerfile: Dockerfile
     container_name: producer
     depends_on:
-      - kafka
+      kafka:
+        condition: service_healthy
     working_dir: /app
     volumes:
       - ./producer:/app
-      - ./data:/app/data
+      - ./datasets:/app/datasets:ro
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      TRIPS_FILE_PATH: /app/datasets/valid_trips.parquet
     command: ["python", "replay_producer.py"]
+  
+  consumer:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile
+    container_name: consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    working_dir: /app
+    volumes:
+      - ./consumer:/app
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    command: ["python", "consumer.py"]
