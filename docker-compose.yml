@@ -63,4 +63,5 @@ services:
       - ./consumer:/app
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      PYTHONUNBUFFERED: "1" 
     command: ["python", "consumer.py"]
