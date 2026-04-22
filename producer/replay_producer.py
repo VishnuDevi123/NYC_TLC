@@ -40,25 +40,25 @@ while producer is None:
         print("Kafka not ready for producer. Retrying in 2 seconds...")
         time.sleep(2)
 
-def create_producer(max_retries=2, retry_delay_seconds=2):
-    for attempt in range(1, max_retries + 1):
-        try:
-            return KafkaProducer(
-                bootstrap_servers=BOOTSTRAP_SERVERS,
-                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-            )
-        except NoBrokersAvailable:
-            if attempt == max_retries:
-                raise
-            print(
-                f"Kafka broker unavailable at {BOOTSTRAP_SERVERS}. "
-                f"Retrying in {retry_delay_seconds}s ({attempt}/{max_retries})..."
-            )
-            time.sleep(retry_delay_seconds)
+# def create_producer(max_retries=2, retry_delay_seconds=2):
+#     for attempt in range(1, max_retries + 1):
+#         try:
+#             return KafkaProducer(
+#                 bootstrap_servers=BOOTSTRAP_SERVERS,
+#                 value_serializer=lambda v: json.dumps(v).encode("utf-8"),
+#             )
+#         except NoBrokersAvailable:
+#             if attempt == max_retries:
+#                 raise
+#             print(
+#                 f"Kafka broker unavailable at {BOOTSTRAP_SERVERS}. "
+#                 f"Retrying in {retry_delay_seconds}s ({attempt}/{max_retries})..."
+#             )
+#             time.sleep(retry_delay_seconds)
 
 
-# initilize kafka producer with bootstrap servers and value serializer to convert the event data to JSON format before sending it to the Kafka topic
-if producer is not None: producer = create_producer()
+# # initilize kafka producer with bootstrap servers and value serializer to convert the event data to JSON format before sending it to the Kafka topic
+# if producer is not None: producer = create_producer()
 
 print(f"Loaded {len(df)} rows from {FILE_PATH}")
 
