@@ -27,6 +27,11 @@ consumer = KafkaConsumer(
 total_events = 0
 total_fare = 0.0
 pickup_zone_counts = defaultdict(int)
+total_distance = 0.0
+total_duration = 0.0
+
+routes_count = defaultdict(int)
+routes_revenue = defaultdict(float)
 
 # consume messages from the Kafka topic and update the total number of events, total fare amount, and count of pickups per zone
 for message in consumer:
@@ -34,6 +39,26 @@ for message in consumer:
     total_events += 1
     fare_amount = event.get("fare_amount", 0.0)
     pu_location = event.get("PULocationID")
+    trip_distance = event.get("trip_distance")
+    trip_duration = event.get("trip_duration")
+    do_location = event.get("DOLocationID")
+    
+    total_amount = event.get("total_amount", 0.0)
+    
+    if pu_location is not None and do_location is not None and total_amount is not None:
+        route_key = (pu_location, do_location)
+        routes_revenue[route_key] += total_amount
+    
+    if pu_location is not None and do_location is not None:
+        route_key = (pu_location, do_location)
+        routes_count[route_key] += 1
+        
+    if trip_duration is not None:
+        total_duration += trip_duration
+    
+    if trip_distance is not None:
+        total_distance += trip_distance
+        
     if pu_location is not None:
         pickup_zone_counts[pu_location] += 1
 
@@ -41,10 +66,13 @@ for message in consumer:
         total_fare += fare_amount
 
     if total_events % 50 == 0:
+        avg_distance = total_distance / total_events if total_events > 0 else 0.0
+        avg_duration = total_duration / total_events if total_events > 0 else 0.0
         avg_fare = total_fare / total_events if total_events > 0 else 0.0
         # Get the top 5 pickup zones by count
         top_zones = sorted(pickup_zone_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-
+        top_routes = sorted(routes_count.items(), key=lambda x: x[1], reverse=True)[:5]
+        
         print("\n--- Current Statistics ---")
         print(f"Total events consumed: {total_events}")
         print(f"Average fare so far: {avg_fare:.2f}")
@@ -53,5 +81,3 @@ for message in consumer:
 
 print(f"Listening to topic: {TOPIC}")
 
-for message in consumer:
-    print(message.value)
