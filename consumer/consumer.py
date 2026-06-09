@@ -1,21 +1,34 @@
+import csv
+import json
+import math
 import os
 import time
-import json
 from collections import Counter, defaultdict, deque
-from kafka import KafkaConsumer
+from datetime import datetime, timezone
+from pathlib import Path
 
 # The IDEA is
 # PRODUCER --> Bootstrap Servers (send data)
 # CONSUMER <-- Bootstrap Servers (receive data)
 
 time.sleep(10)  # Wait for Kafka to be ready
-TOPIC = "taxi_trips_events"
+SOURCE_TOPIC = os.getenv("SOURCE_TOPIC", "taxi_trips_events")
+CLEAN_TOPIC = os.getenv("CLEAN_TOPIC", "clean_trip_events")
+DEAD_LETTER_TOPIC = os.getenv("DEAD_LETTER_TOPIC", "dead_letter_events")
+ZONE_METRICS_TOPIC = os.getenv("ZONE_METRICS_TOPIC", "zone_metrics")
+ROUTE_METRICS_TOPIC = os.getenv("ROUTE_METRICS_TOPIC", "route_metrics")
+
 LOG_INTERVAL = int(os.getenv("CONSUMER_LOG_INTERVAL", "50"))
 ROLLING_WINDOW_SIZE = int(os.getenv("ROLLING_WINDOW_SIZE", "50"))
 MIN_PROFITABLE_ROUTE_TRIPS = int(os.getenv("MIN_PROFITABLE_ROUTE_TRIPS", "3"))
+MAX_FARE_PER_MILE = float(os.getenv("MAX_FARE_PER_MILE", "100"))
+MAX_TRIP_DURATION_MIN = float(os.getenv("MAX_TRIP_DURATION_MIN", "180"))
 
 # Kafka bootstrap servers which will be used to connect to the Kafka cluster for consuming messages.
 BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
+CONSUMER_GROUP_ID = os.getenv("CONSUMER_GROUP_ID", "taxi-trip-analytics-consumer")
+ZONE_LOOKUP_PATH = Path(os.getenv("ZONE_LOOKUP_PATH", "/app/taxi_zone_lookup.csv"))
+
 
 consumer = KafkaConsumer(
     TOPIC,
