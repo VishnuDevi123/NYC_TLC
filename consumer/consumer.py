@@ -1,167 +1,257 @@
-import csv
 import json
 import math
 import os
 import time
 from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
-from pathlib import Path
+from uuid import uuid4
 
-# The IDEA is
-# PRODUCER --> Bootstrap Servers (send data)
-# CONSUMER <-- Bootstrap Servers (receive data)
+from kafka import KafkaConsumer, KafkaProducer
 
-time.sleep(10)  # Wait for Kafka to be ready
+
 SOURCE_TOPIC = os.getenv("SOURCE_TOPIC", "taxi_trips_events")
 CLEAN_TOPIC = os.getenv("CLEAN_TOPIC", "clean_trip_events")
 DEAD_LETTER_TOPIC = os.getenv("DEAD_LETTER_TOPIC", "dead_letter_events")
+ANOMALY_TOPIC = os.getenv("ANOMALY_TOPIC", "anomaly_events")
 ZONE_METRICS_TOPIC = os.getenv("ZONE_METRICS_TOPIC", "zone_metrics")
 ROUTE_METRICS_TOPIC = os.getenv("ROUTE_METRICS_TOPIC", "route_metrics")
 
-LOG_INTERVAL = int(os.getenv("CONSUMER_LOG_INTERVAL", "50"))
-ROLLING_WINDOW_SIZE = int(os.getenv("ROLLING_WINDOW_SIZE", "50"))
-MIN_PROFITABLE_ROUTE_TRIPS = int(os.getenv("MIN_PROFITABLE_ROUTE_TRIPS", "3"))
-MAX_FARE_PER_MILE = float(os.getenv("MAX_FARE_PER_MILE", "100"))
-MAX_TRIP_DURATION_MIN = float(os.getenv("MAX_TRIP_DURATION_MIN", "180"))
-
-# Kafka bootstrap servers which will be used to connect to the Kafka cluster for consuming messages.
 BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
 CONSUMER_GROUP_ID = os.getenv("CONSUMER_GROUP_ID", "taxi-trip-analytics-consumer")
-ZONE_LOOKUP_PATH = Path(os.getenv("ZONE_LOOKUP_PATH", "/app/taxi_zone_lookup.csv"))
+CONSUMER_LOG_INTERVAL = int(os.getenv("CONSUMER_LOG_INTERVAL", "50"))
+ROLLING_WINDOW_SIZE = int(os.getenv("ROLLING_WINDOW_SIZE", "50"))
 
-
-consumer = KafkaConsumer(
-    TOPIC,
-    bootstrap_servers=BOOTSTRAP_SERVERS,
-    auto_offset_reset="earliest",
-    enable_auto_commit=True,
-    value_deserializer=lambda x: json.loads(x.decode("utf-8")),
+REQUIRED_FIELDS = (
+    "event_id",
+    "tpep_pickup_datetime",
+    "tpep_dropoff_datetime",
+    "PULocationID",
+    "DOLocationID",
+    "passenger_count",
+    "trip_distance",
+    "fare_amount",
+    "total_amount",
 )
 
-def as_float(value, default=0.0):
-    if value is None:
-        return default
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def isoformat(value):
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def parse_datetime(value):
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def parse_float(value):
+    if value is None or isinstance(value, bool):
+        return None
     try:
-        return float(value)
+        parsed = float(value)
     except (TypeError, ValueError):
-        return default
+        return None
+    if not math.isfinite(parsed):
+        return None
+    return parsed
 
 
-def calculate_route_profitability():
-    profitable_routes = []
+def parse_location_id(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if str(value).strip() not in {str(parsed), f"{parsed}.0"}:
+        return None
+    return parsed
 
-    for route_key, trip_count in routes_count.items():
-        if trip_count < MIN_PROFITABLE_ROUTE_TRIPS:
-            continue
 
-        revenue = routes_revenue[route_key]
-        distance = routes_distance[route_key]
-        duration = routes_duration[route_key]
-        tips = routes_tips[route_key]
+def reason(reason_type, field, value=None):
+    item = {"type": reason_type, "field": field}
+    if value is not None:
+        item["value"] = value
+    return item
 
-        revenue_per_mile = revenue / distance if distance > 0 else 0.0
-        revenue_per_minute = revenue / duration if duration > 0 else 0.0
-        avg_revenue = revenue / trip_count
-        avg_tip = tips / trip_count
 
-        # Simple score that rewards routes that earn well by distance, time, and trip.
-        score = (revenue_per_mile * 0.4) + (revenue_per_minute * 0.4) + (avg_revenue * 0.2)
+def validate_raw_event(event, now=None):
+    reasons = []
+    now = now or utc_now()
 
-        profitable_routes.append(
-            {
-                "route": route_key,
-                "trips": trip_count,
-                "revenue": round(revenue, 2),
-                "revenue_per_mile": round(revenue_per_mile, 2),
-                "revenue_per_minute": round(revenue_per_minute, 2),
-                "avg_revenue": round(avg_revenue, 2),
-                "avg_tip": round(avg_tip, 2),
-                "score": round(score, 2),
-            }
+    for field in REQUIRED_FIELDS:
+        if field not in event:
+            reasons.append(reason("missing_required_field", field))
+
+    if reasons:
+        return reasons
+
+    pickup_time = parse_datetime(event.get("tpep_pickup_datetime"))
+    dropoff_time = parse_datetime(event.get("tpep_dropoff_datetime"))
+
+    if pickup_time is None:
+        reasons.append(
+            reason(
+                "invalid_pickup_datetime",
+                "tpep_pickup_datetime",
+                event.get("tpep_pickup_datetime"),
+            )
+        )
+    if dropoff_time is None:
+        reasons.append(
+            reason(
+                "invalid_dropoff_datetime",
+                "tpep_dropoff_datetime",
+                event.get("tpep_dropoff_datetime"),
+            )
+        )
+    if pickup_time is not None and pickup_time > now:
+        reasons.append(
+            reason(
+                "future_pickup_datetime",
+                "tpep_pickup_datetime",
+                event.get("tpep_pickup_datetime"),
+            )
+        )
+    if pickup_time is not None and dropoff_time is not None and dropoff_time <= pickup_time:
+        reasons.append(
+            reason(
+                "non_positive_trip_duration",
+                "tpep_dropoff_datetime",
+                event.get("tpep_dropoff_datetime"),
+            )
         )
 
-    return sorted(profitable_routes, key=lambda route: route["score"], reverse=True)[:5]
+    passenger_count = parse_float(event.get("passenger_count"))
+    trip_distance = parse_float(event.get("trip_distance"))
+    fare_amount = parse_float(event.get("fare_amount"))
+    total_amount = parse_float(event.get("total_amount"))
+
+    if passenger_count is None:
+        reasons.append(reason("invalid_passenger_count", "passenger_count", event.get("passenger_count")))
+    elif passenger_count <= 0:
+        reasons.append(reason("non_positive_passenger_count", "passenger_count", event.get("passenger_count")))
+
+    if trip_distance is None:
+        reasons.append(reason("invalid_trip_distance", "trip_distance", event.get("trip_distance")))
+    elif trip_distance <= 0:
+        reasons.append(reason("non_positive_trip_distance", "trip_distance", event.get("trip_distance")))
+
+    if fare_amount is None:
+        reasons.append(reason("invalid_fare_amount", "fare_amount", event.get("fare_amount")))
+    elif fare_amount < 0:
+        reasons.append(reason("negative_fare_amount", "fare_amount", event.get("fare_amount")))
+
+    if total_amount is None:
+        reasons.append(reason("invalid_total_amount", "total_amount", event.get("total_amount")))
+    elif total_amount < 0:
+        reasons.append(reason("negative_total_amount", "total_amount", event.get("total_amount")))
+
+    if parse_location_id(event.get("PULocationID")) is None:
+        reasons.append(reason("invalid_pu_location_id", "PULocationID", event.get("PULocationID")))
+    if parse_location_id(event.get("DOLocationID")) is None:
+        reasons.append(reason("invalid_do_location_id", "DOLocationID", event.get("DOLocationID")))
+
+    return reasons
 
 
-total_events = 0
-total_fare = 0.0
-pickup_zone_counts = defaultdict(int)
-total_distance = 0.0
-total_duration = 0.0
-anomaly_counts = Counter()
-recent_pickups = deque(maxlen=ROLLING_WINDOW_SIZE)
+def publish_dlq(event, producer, reasons, received_at):
+    dlq_event = {
+        "error_type": "validation_failed",
+        "reasons": reasons,
+        "raw_event": event,
+        "received_at": isoformat(received_at),
+    }
+    producer.send(DEAD_LETTER_TOPIC, key=event.get("event_id") or f"processing-{uuid4()}", value=dlq_event)
+    return dlq_event
 
-routes_count = defaultdict(int)
-routes_revenue = defaultdict(float)
-routes_distance = defaultdict(float)
-routes_duration = defaultdict(float)
-routes_tips = defaultdict(float)
 
-print(f"Listening to topic: {TOPIC}")
+def process_raw_event(event, producer, stats, now=None):
+    now = now or utc_now()
+    stats["total_events"] += 1
 
-# consume messages from the Kafka topic and update the total number of events, total fare amount, and count of pickups per zone
-for message in consumer:
-    event = message.value
-    total_events += 1
-    fare_amount = as_float(event.get("fare_amount"))
-    pu_location = event.get("PULocationID")
-    trip_distance = as_float(event.get("trip_distance"))
-    trip_duration = as_float(event.get("trip_duration_min", event.get("trip_duration")))
-    do_location = event.get("DOLocationID")
+    reasons = validate_raw_event(event, now=now)
+    if reasons:
+        publish_dlq(event, producer, reasons, now)
+        stats["dlq_events"] += 1
+        for item in reasons:
+            stats["dlq_reason_counts"][item["type"]] += 1
+        return {"status": "dlq", "reasons": reasons}
 
-    total_amount = as_float(event.get("total_amount"))
-    tip_amount = as_float(event.get("tip_amount"))
+    return {"status": "accepted"}
 
-    if pu_location is not None and do_location is not None and total_amount is not None:
-        route_key = (pu_location, do_location)
-        routes_revenue[route_key] += total_amount
-        routes_distance[route_key] += trip_distance
-        routes_duration[route_key] += trip_duration
-        routes_tips[route_key] += tip_amount
 
-    if pu_location is not None and do_location is not None:
-        route_key = (pu_location, do_location)
-        routes_count[route_key] += 1
+def build_stats():
+    return {
+        "total_events": 0,
+        "clean_events": 0,
+        "dlq_events": 0,
+        "anomaly_events": 0,
+        "dlq_reason_counts": Counter(),
+        "pickup_zone_counts": defaultdict(int),
+        "recent_pickups": deque(maxlen=ROLLING_WINDOW_SIZE),
+        "routes_count": defaultdict(int),
+        "routes_revenue": defaultdict(float),
+        "routes_distance": defaultdict(float),
+        "routes_duration": defaultdict(float),
+        "routes_tips": defaultdict(float),
+    }
 
-    total_duration += trip_duration
-    total_distance += trip_distance
 
-    if pu_location is not None:
-        pickup_zone_counts[pu_location] += 1
-        recent_pickups.append(pu_location)
+def print_health(stats):
+    print("\n--- Consumer Health ---")
+    print(f"Source topic: {SOURCE_TOPIC}")
+    print(f"Clean topic: {CLEAN_TOPIC}")
+    print(f"Dead letter topic: {DEAD_LETTER_TOPIC}")
+    print(f"Anomaly topic: {ANOMALY_TOPIC}")
+    print(f"Zone metrics topic: {ZONE_METRICS_TOPIC}")
+    print(f"Route metrics topic: {ROUTE_METRICS_TOPIC}")
+    print(f"Total raw events seen: {stats['total_events']}")
+    print(f"Clean events produced: {stats['clean_events']}")
+    print(f"DLQ events produced: {stats['dlq_events']}")
+    print(f"Top DLQ reasons: {stats['dlq_reason_counts'].most_common(5)}")
 
-    total_fare += fare_amount
 
-    if trip_distance <= 0:
-        anomaly_counts["non_positive_distance"] += 1
-    if fare_amount <= 0 or total_amount <= 0:
-        anomaly_counts["non_positive_amount"] += 1
-    if trip_distance > 0 and total_amount / trip_distance > 100:
-        anomaly_counts["high_fare_per_mile"] += 1
-    if trip_duration > 180:
-        anomaly_counts["long_duration"] += 1
-    if trip_duration > 60 and trip_distance < 1:
-        anomaly_counts["long_duration_low_distance"] += 1
+def main():
+    time.sleep(10)
+    stats = build_stats()
 
-    if total_events % LOG_INTERVAL == 0:
-        avg_distance = total_distance / total_events if total_events > 0 else 0.0
-        avg_duration = total_duration / total_events if total_events > 0 else 0.0
-        avg_fare = total_fare / total_events if total_events > 0 else 0.0
-        # Get the top 5 pickup zones by count
-        top_zones = sorted(pickup_zone_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-        top_routes = sorted(routes_count.items(), key=lambda x: x[1], reverse=True)[:5]
-        top_revenue_routes = sorted(routes_revenue.items(), key=lambda x: x[1], reverse=True)[:5]
-        top_profitable_routes = calculate_route_profitability()
-        rolling_hot_zones = Counter(recent_pickups).most_common(5)
+    consumer = KafkaConsumer(
+        SOURCE_TOPIC,
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        group_id=CONSUMER_GROUP_ID,
+        auto_offset_reset="earliest",
+        enable_auto_commit=True,
+        value_deserializer=lambda value: json.loads(value.decode("utf-8")),
+    )
+    producer = KafkaProducer(
+        bootstrap_servers=BOOTSTRAP_SERVERS,
+        key_serializer=lambda key: str(key).encode("utf-8"),
+        value_serializer=lambda value: json.dumps(value, default=str).encode("utf-8"),
+    )
 
-        print("\n--- Current Statistics ---")
-        print(f"Total events consumed: {total_events}")
-        print(f"Average fare so far: {avg_fare:.2f}")
-        print(f"Average distance so far: {avg_distance:.2f}")
-        print(f"Average duration so far: {avg_duration:.2f} minutes")
-        print(f"Top 5 pickup zones: {top_zones}")
-        print(f"Top 5 pickup zones in last {ROLLING_WINDOW_SIZE} events: {rolling_hot_zones}")
-        print(f"Top 5 routes by trip count: {top_routes}")
-        print(f"Top 5 routes by revenue: {top_revenue_routes}")
-        print(f"Top 5 profitable routes: {top_profitable_routes}")
-        print(f"Anomaly counts: {dict(anomaly_counts)}")
+    print_health(stats)
+    for message in consumer:
+        process_raw_event(message.value, producer=producer, stats=stats)
+        if stats["total_events"] % CONSUMER_LOG_INTERVAL == 0:
+            print_health(stats)
+
+
+if __name__ == "__main__":
+    main()
