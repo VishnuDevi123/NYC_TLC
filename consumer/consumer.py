@@ -1,25 +1,39 @@
+import csv
 import json
 import math
 import os
 import time
 from collections import Counter, defaultdict, deque
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import uuid4
 
 from kafka import KafkaConsumer, KafkaProducer
 
 
-SOURCE_TOPIC = os.getenv("SOURCE_TOPIC", "taxi_trips_events")
-CLEAN_TOPIC = os.getenv("CLEAN_TOPIC", "clean_trip_events")
-DEAD_LETTER_TOPIC = os.getenv("DEAD_LETTER_TOPIC", "dead_letter_events")
-ANOMALY_TOPIC = os.getenv("ANOMALY_TOPIC", "anomaly_events")
-ZONE_METRICS_TOPIC = os.getenv("ZONE_METRICS_TOPIC", "zone_metrics")
-ROUTE_METRICS_TOPIC = os.getenv("ROUTE_METRICS_TOPIC", "route_metrics")
+SOURCE_TOPIC = "taxi_trips_events"
+CLEAN_TOPIC = "clean_trip_events"
+DEAD_LETTER_TOPIC = "dead_letter_events"
+ANOMALY_TOPIC = "anomaly_events"
+ZONE_METRICS_TOPIC = "zone_metrics"
+ROUTE_METRICS_TOPIC = "route_metrics"
+
+if "ZONE_LOOKUP_PATH" not in os.environ:
+    SOURCE_TOPIC = os.environ.get("SOURCE_TOPIC", SOURCE_TOPIC)
+    CLEAN_TOPIC = os.environ.get("CLEAN_TOPIC", CLEAN_TOPIC)
+    DEAD_LETTER_TOPIC = os.environ.get("DEAD_LETTER_TOPIC", DEAD_LETTER_TOPIC)
+    ANOMALY_TOPIC = os.environ.get("ANOMALY_TOPIC", ANOMALY_TOPIC)
+    ZONE_METRICS_TOPIC = os.environ.get("ZONE_METRICS_TOPIC", ZONE_METRICS_TOPIC)
+    ROUTE_METRICS_TOPIC = os.environ.get("ROUTE_METRICS_TOPIC", ROUTE_METRICS_TOPIC)
 
 BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
-CONSUMER_GROUP_ID = os.getenv("CONSUMER_GROUP_ID", "taxi-trip-analytics-consumer")
-CONSUMER_LOG_INTERVAL = int(os.getenv("CONSUMER_LOG_INTERVAL", "50"))
-ROLLING_WINDOW_SIZE = int(os.getenv("ROLLING_WINDOW_SIZE", "50"))
+CONSUMER_GROUP_ID = "taxi-trip-analytics-consumer"
+CONSUMER_LOG_INTERVAL = 50
+ROLLING_WINDOW_SIZE = 50
+ZONE_LOOKUP_FILE_CANDIDATES = (
+    Path(__file__).resolve().parent / "taxi_zone_lookup.csv",
+    Path(__file__).resolve().parent.parent / "taxi_zone_lookup.csv",
+)
 
 REQUIRED_FIELDS = (
     "event_id",
@@ -34,6 +48,27 @@ REQUIRED_FIELDS = (
 )
 
 
+def load_zone_lookup():
+    zone_lookup_file = next((path for path in ZONE_LOOKUP_FILE_CANDIDATES if path.exists()), None)
+    if zone_lookup_file is None:
+        checked_paths = ", ".join(str(path) for path in ZONE_LOOKUP_FILE_CANDIDATES)
+        raise FileNotFoundError(f"taxi_zone_lookup.csv not found. Checked: {checked_paths}")
+
+    zones = {}
+    with zone_lookup_file.open(newline="") as zone_file:
+        reader = csv.DictReader(zone_file)
+        for row in reader:
+            location_id = parse_location_id(row.get("LocationID"))
+            if location_id is None:
+                continue
+            zones[location_id] = {
+                "borough": row.get("Borough"),
+                "zone": row.get("Zone"),
+                "service_zone": row.get("service_zone"),
+            }
+    return zones
+
+# current time in UTC for when the event was received, used for validating future pickup times and calculating trip durations
 def utc_now():
     return datetime.now(timezone.utc)
 
@@ -43,7 +78,7 @@ def isoformat(value):
         value = value.replace(tzinfo=timezone.utc)
     return value.astimezone(timezone.utc).isoformat()
 
-
+# parsing datetime fields from the raw events and handling different formats and timezones.
 def parse_datetime(value):
     if isinstance(value, datetime):
         parsed = value
@@ -71,7 +106,7 @@ def parse_float(value):
         return None
     return parsed
 
-
+# location id should not be a float and should be positive integer so thats why the checks are more strict
 def parse_location_id(value):
     if value is None or isinstance(value, bool):
         return None
@@ -79,26 +114,33 @@ def parse_location_id(value):
         parsed = int(value)
     except (TypeError, ValueError):
         return None
+    # make sure the string representation matches to avoid parsing "1abc" as 1
     if str(value).strip() not in {str(parsed), f"{parsed}.0"}:
         return None
     return parsed
 
 
+ZONE_LOOKUP = load_zone_lookup()
+
+# for creating the reason object, essentially creating an dict object and include the type of reason and value of the field
+# that caused the validation failure, this will be used for monitoring and alerting on the most common reasons for dlq events
 def reason(reason_type, field, value=None):
     item = {"type": reason_type, "field": field}
     if value is not None:
         item["value"] = value
     return item
 
-
+# validation function that checks for required fields, validates datetime formats and logical consistency, 
+# checks numeric fields for valid values, and returns a list of reasons if any validation fails
 def validate_raw_event(event, now=None):
+    # initily empty list
     reasons = []
     now = now or utc_now()
 
     for field in REQUIRED_FIELDS:
         if field not in event:
             reasons.append(reason("missing_required_field", field))
-
+    # if initiliy empty reason is not empty then it means some required fields are missing and we can return early without doing further validation checks
     if reasons:
         return reasons
 
@@ -143,6 +185,7 @@ def validate_raw_event(event, now=None):
     fare_amount = parse_float(event.get("fare_amount"))
     total_amount = parse_float(event.get("total_amount"))
 
+    # for numeric fields we check if they are None after parsing which means they are invalid and the event needs to be sent to dlq
     if passenger_count is None:
         reasons.append(reason("invalid_passenger_count", "passenger_count", event.get("passenger_count")))
     elif passenger_count <= 0:
@@ -163,10 +206,18 @@ def validate_raw_event(event, now=None):
     elif total_amount < 0:
         reasons.append(reason("negative_total_amount", "total_amount", event.get("total_amount")))
 
-    if parse_location_id(event.get("PULocationID")) is None:
+    pu_location_id = parse_location_id(event.get("PULocationID"))
+    do_location_id = parse_location_id(event.get("DOLocationID"))
+
+    if pu_location_id is None:
         reasons.append(reason("invalid_pu_location_id", "PULocationID", event.get("PULocationID")))
-    if parse_location_id(event.get("DOLocationID")) is None:
+    elif pu_location_id not in ZONE_LOOKUP:
+        reasons.append(reason("unknown_pu_location_id", "PULocationID", event.get("PULocationID")))
+
+    if do_location_id is None:
         reasons.append(reason("invalid_do_location_id", "DOLocationID", event.get("DOLocationID")))
+    elif do_location_id not in ZONE_LOOKUP:
+        reasons.append(reason("unknown_do_location_id", "DOLocationID", event.get("DOLocationID")))
 
     return reasons
 
@@ -182,11 +233,59 @@ def publish_dlq(event, producer, reasons, received_at):
     return dlq_event
 
 
+def build_clean_event(event, processed_at):
+    pickup_time = parse_datetime(event["tpep_pickup_datetime"])
+    dropoff_time = parse_datetime(event["tpep_dropoff_datetime"])
+    pu_location_id = parse_location_id(event["PULocationID"])
+    do_location_id = parse_location_id(event["DOLocationID"])
+
+    passenger_count = parse_float(event["passenger_count"])
+    trip_distance = parse_float(event["trip_distance"])
+    fare_amount = parse_float(event["fare_amount"])
+    tip_amount = parse_float(event.get("tip_amount")) or 0.0
+    total_amount = parse_float(event["total_amount"])
+    trip_duration_min = (dropoff_time - pickup_time).total_seconds() / 60
+
+    pickup_zone = ZONE_LOOKUP[pu_location_id]
+    dropoff_zone = ZONE_LOOKUP[do_location_id]
+
+    return {
+        "event_id": event["event_id"],
+        "event_time": isoformat(pickup_time),
+        "pickup_date": pickup_time.date().isoformat(),
+        "pickup_hour": pickup_time.hour,
+        "dropoff_time": isoformat(dropoff_time),
+        "pu_location_id": pu_location_id,
+        "do_location_id": do_location_id,
+        "pickup_borough": pickup_zone["borough"],
+        "pickup_zone": pickup_zone["zone"],
+        "pickup_service_zone": pickup_zone["service_zone"],
+        "dropoff_borough": dropoff_zone["borough"],
+        "dropoff_zone": dropoff_zone["zone"],
+        "dropoff_service_zone": dropoff_zone["service_zone"],
+        "passenger_count": passenger_count,
+        "trip_distance": trip_distance,
+        "trip_duration_min": trip_duration_min,
+        "fare_amount": fare_amount,
+        "tip_amount": tip_amount,
+        "total_amount": total_amount,
+        "fare_per_mile": fare_amount / trip_distance,
+        "tip_percent": (tip_amount / total_amount * 100) if total_amount else 0.0,
+        "route_key": f"{pu_location_id}->{do_location_id}",
+        "processed_at": isoformat(processed_at),
+    }
+
+
+def publish_clean_event(clean_event, producer):
+    producer.send(CLEAN_TOPIC, key=clean_event["pu_location_id"], value=clean_event)
+
+
 def process_raw_event(event, producer, stats, now=None):
     now = now or utc_now()
     stats["total_events"] += 1
 
     reasons = validate_raw_event(event, now=now)
+    # if reasons is not empty that means the event has some invalid fields, the event needs to be sent to dlq
     if reasons:
         publish_dlq(event, producer, reasons, now)
         stats["dlq_events"] += 1
@@ -194,9 +293,14 @@ def process_raw_event(event, producer, stats, now=None):
             stats["dlq_reason_counts"][item["type"]] += 1
         return {"status": "dlq", "reasons": reasons}
 
-    return {"status": "accepted"}
+    clean_event = build_clean_event(event, now)
+    publish_clean_event(clean_event, producer)
+    stats["clean_events"] += 1
+    return {"status": "clean", "clean_event": clean_event}
 
-
+# stats for showing how many events were validated and sent to clean topic vs how many were sent to dlq
+# also keeping track of the reasons for dlq events for monitoring and alerting purposes
+# and also keeping track of recent pickups for calculating zone and route metrics
 def build_stats():
     return {
         "total_events": 0,
@@ -232,6 +336,7 @@ def main():
     time.sleep(10)
     stats = build_stats()
 
+    # creating consumer instance to consume from the source topic
     consumer = KafkaConsumer(
         SOURCE_TOPIC,
         bootstrap_servers=BOOTSTRAP_SERVERS,
@@ -240,12 +345,16 @@ def main():
         enable_auto_commit=True,
         value_deserializer=lambda value: json.loads(value.decode("utf-8")),
     )
+    
+    # creating a producer instance to produce to the other topics like clean_topic, dlq_topic, anamoly_topic for downstream consumers 
+    # the producer is created outside the loop to reuse the same instance for better performance instead of creating a new one for each message
     producer = KafkaProducer(
         bootstrap_servers=BOOTSTRAP_SERVERS,
         key_serializer=lambda key: str(key).encode("utf-8"),
         value_serializer=lambda value: json.dumps(value, default=str).encode("utf-8"),
     )
 
+    # print initial health status before processing any messages and then loop through the message from the source topic for next batch of processing
     print_health(stats)
     for message in consumer:
         process_raw_event(message.value, producer=producer, stats=stats)

@@ -1,126 +1,83 @@
 # Consumer Streaming Implementation Plan
 
-## Purpose
+## Goal
 
-This document is a handoff for the next development session. It captures the consumer-side streaming design decisions, target Kafka topics, algorithmic implementation plan, and vertical slices to implement.
+Build the consumer-side Kafka pipeline for NYC TLC trip events.
 
-The project goal is to evolve the current NYC TLC Kafka pipeline from a console-only consumer into a real streaming analytics processor. The consumer should read raw taxi trip events, validate them, enrich them with taxi zone metadata, publish clean records, publish bad records to a dead-letter topic, detect anomalies, and emit downstream metrics topics that can later feed storage, dashboards, alerts, and notebooks.
-
-## Current Context
-
-The producer publishes raw NYC taxi trip events into Kafka.
-
-Current source topic:
+Input topic:
 
 ```text
 taxi_trips_events
 ```
 
-The current consumer computes basic in-memory stats and prints them:
-
-- total events consumed
-- average fare
-- average distance
-- average duration
-- top pickup zones
-- rolling hot pickup zones
-- top routes by trip count
-- top routes by revenue
-- top profitable routes
-- anomaly counts
-
-The repo also now has a taxi zone lookup CSV:
+Output topics:
 
 ```text
-taxi_zone_lookup.csv
-```
-
-Expected lookup columns:
-
-```text
-LocationID,Borough,Zone,service_zone
-```
-
-This lookup should be used to enrich `PULocationID` and `DOLocationID` into human-readable pickup/dropoff borough, zone, and service zone fields.
-
-## Design Decisions Already Made
-
-Invalid impossible records must be dropped from metrics.
-
-Invalid records should be published only to:
-
-```text
+clean_trip_events
 dead_letter_events
+anomaly_events
+zone_metrics
+route_metrics
 ```
 
-Unknown `PULocationID` or `DOLocationID` must be treated as invalid for this project and sent to `dead_letter_events`.
+## Processing Order
 
-Anomalies are different from invalid records. An anomalous trip can still be a valid observed trip.
-
-Anomalies should:
-
-- stay in `clean_trip_events`
-- be included in metrics
-- also be copied to `anomaly_events`
-
-First metric window style should be event-count based, not event-time based.
-
-Initial rolling window:
+Process each raw event in this order:
 
 ```text
-last N valid events
-```
-
-Default `N` can remain:
-
-```text
-50
-```
-
-Per-event enriched records should be implemented before aggregate metrics. `clean_trip_events` becomes the trusted source of truth for later storage, dashboards, notebooks, and ML workflows.
-
-## Target Architecture
-
-Raw stream enters the consumer:
-
-```text
-taxi_trips_events
-```
-
-The consumer validates, enriches, detects anomalies, computes metrics, and publishes to purpose-built output topics:
-
-```text
-taxi_trips_events
+raw event
    |
    v
-consumer.py
+validate required fields and impossible values
+   |
+   +--> invalid -> dead_letter_events only, stop
+   |
+   v
+zone lookup enrichment
+   |
+   +--> unknown zone -> dead_letter_events only, stop
+   |
+   v
+derive clean trip fields
    |
    +--> clean_trip_events
-   +--> dead_letter_events
-   +--> anomaly_events
-   +--> zone_metrics
-   +--> route_metrics
+   |
+   v
+detect anomaly
+   |
+   +--> anomaly_events when suspicious but valid
+   |
+   v
+update metric state from this clean valid event
+   |
+   +--> zone_metrics / route_metrics at metric interval
 ```
 
-Future downstream consumers can then be added:
+Do not calculate zone or route metrics before validation, DLQ routing, and clean-event construction.
 
-```text
-clean_trip_events      -> storage_writer.py
-dead_letter_events     -> dlq_monitor.py
-anomaly_events         -> anomaly_alerts.py
-zone_metrics           -> dashboard_api.py
-route_metrics          -> route_ranker.py
-```
+Invalid records must not update:
+
+- rolling zone window
+- route aggregates
+- fare, distance, or duration averages
+
+Anomalies are valid records. They must:
+
+- stay in `clean_trip_events`
+- be copied to `anomaly_events`
+- be included in metric state
+
+Metric processors should use `clean_trip_events` as input. Do not read both `clean_trip_events`
+and `anomaly_events` for metrics unless deduplicating by `event_id`, because anomaly records
+already exist in `clean_trip_events`.
 
 ## Topic Contracts
 
 ### `clean_trip_events`
 
-Purpose: trusted enriched trip stream.
-
 Produced when a raw event is structurally valid and has known pickup/dropoff locations.
 
-Fields should include:
+Required output fields:
 
 ```json
 {
@@ -150,29 +107,17 @@ Fields should include:
 }
 ```
 
-Later uses:
-
-- write to Parquet or object storage
-- dashboard source
-- notebook source
-- feature source for ML
-- replay source for downstream jobs
-
-Recommended storage partitioning later:
+Kafka key:
 
 ```text
-pickup_date / pickup_hour / pickup_borough
+pu_location_id
 ```
 
 ### `dead_letter_events`
 
-Purpose: data quality audit stream for unusable records.
+Produced when a raw event cannot be trusted or cannot support analytics.
 
-Produced when a raw event cannot be trusted or cannot support project analytics.
-
-DLQ reasons should be structured, not free-text only.
-
-Example:
+Required output shape:
 
 ```json
 {
@@ -204,35 +149,17 @@ Invalid conditions:
 - unknown `PULocationID` not in lookup table
 - unknown `DOLocationID` not in lookup table
 
-DLQ records are excluded from:
+Kafka key:
 
-- `clean_trip_events`
-- `anomaly_events`
-- `zone_metrics`
-- `route_metrics`
-
-Later uses:
-
-- DLQ reason counts
-- DLQ rate alerting
-- raw failed event samples
-- retry workflow after schema or lookup fixes
+```text
+event_id if present, else fallback processing id
+```
 
 ### `anomaly_events`
 
-Purpose: suspicious but valid records.
+Produced when a clean trip is suspicious but still valid.
 
-Produced when a clean trip has unusual values but is still structurally valid.
-
-Anomalies must also remain in:
-
-```text
-clean_trip_events
-zone_metrics
-route_metrics
-```
-
-Example:
+Required output shape:
 
 ```json
 {
@@ -253,36 +180,30 @@ Example:
 
 Initial anomaly rules:
 
-- high fare per mile, for example `fare_per_mile > 100`
-- very long duration, for example `trip_duration_min > 180`
-- long duration with low distance, for example `trip_duration_min > 60 and trip_distance < 1`
-- unusually high tip percent, for example `tip_percent > 60`
-- unusually high total amount, threshold can be configurable
+- `fare_per_mile > MAX_FARE_PER_MILE`
+- `trip_duration_min > MAX_TRIP_DURATION_MIN`
+- `trip_duration_min > 60 and trip_distance < 1`
+- `tip_percent > HIGH_TIP_PERCENT_THRESHOLD`
+- `total_amount > HIGH_TOTAL_AMOUNT_THRESHOLD`
 
-Later uses:
+Kafka key:
 
-- fraud/quality alerting
-- anomaly trend reports
-- top anomalous zones/routes
-- severe anomaly notification
+```text
+event_id
+```
 
 ### `zone_metrics`
 
-Purpose: rolling demand and fare metrics by pickup zone.
+Source: valid clean trips from `clean_trip_events`, or the equivalent clean-event object if
+metrics are computed inside the same process.
 
-Initial window:
-
-```text
-last N valid events
-```
-
-Recommended default:
+Window:
 
 ```text
-N = 50
+last N valid clean events
 ```
 
-Example:
+Required output shape:
 
 ```json
 {
@@ -300,24 +221,16 @@ Example:
 }
 ```
 
-Initial metrics:
+Kafka key:
 
-- pickup count by zone
-- top pickup zones
-- average fare by pickup zone
-- average distance by pickup zone
-- average duration by pickup zone
-
-Later uses:
-
-- live hot-zone dashboard
-- borough-level demand rollup
-- geospatial heatmap
-- surge-like demand scoring
+```text
+pu_location_id
+```
 
 ### `route_metrics`
 
-Purpose: route-level trip volume and profitability.
+Source: valid clean trips from `clean_trip_events`, or the equivalent clean-event object if
+metrics are computed inside the same process.
 
 Route key:
 
@@ -325,7 +238,7 @@ Route key:
 PULocationID->DOLocationID
 ```
 
-Example:
+Required output shape:
 
 ```json
 {
@@ -345,35 +258,23 @@ Example:
 }
 ```
 
-Initial metrics:
-
-- trip count
-- total revenue
-- average revenue
-- revenue per mile
-- revenue per minute
-- average tip
-- profitability score
-
-Score can start simple:
+Profitability score:
 
 ```text
 (revenue_per_mile * 0.4) + (revenue_per_minute * 0.4) + (avg_revenue * 0.2)
 ```
 
-Later uses:
+Kafka key:
 
-- top profitable routes
-- top volume routes
-- route efficiency ranking
-- low-profit route detection
-- route recommendation concept
+```text
+route_key
+```
 
-## Algorithmic Implementations
+## Implementation Steps
 
 ### 1. Required Field Validation
 
-Check the raw event has required fields:
+Required raw fields:
 
 - `event_id`
 - `tpep_pickup_datetime`
@@ -389,41 +290,39 @@ Missing fields go to `dead_letter_events`.
 
 ### 2. Impossible Condition Filtering
 
-Reject records that cannot support valid analytics:
+Reject records with:
 
-- negative or zero trip distance
-- zero or negative passenger count
-- fare under zero
-- total amount under zero
-- invalid datetime
+- `trip_distance <= 0`
+- `passenger_count <= 0`
+- `fare_amount < 0`
+- `total_amount < 0`
+- invalid pickup/dropoff datetime
 - pickup time in future
-- dropoff before pickup
+- dropoff time before or equal to pickup time
+- invalid pickup/dropoff location ID type
 
 Rejected records go to `dead_letter_events` only.
 
 ### 3. Zone Lookup Enrichment
 
-Load `taxi_zone_lookup.csv` once at consumer startup.
+Load `taxi_zone_lookup.csv` once at startup.
+
+Expected columns:
+
+```text
+LocationID,Borough,Zone,service_zone
+```
 
 Use it to map:
 
 - `PULocationID`
 - `DOLocationID`
 
-Add:
-
-- pickup borough
-- pickup zone
-- pickup service zone
-- dropoff borough
-- dropoff zone
-- dropoff service zone
-
-Unknown location IDs go to `dead_letter_events`.
+Unknown IDs go to `dead_letter_events`.
 
 ### 4. Derived Trip Features
 
-For every valid event, compute:
+For every valid enriched event, compute:
 
 - `trip_duration_min`
 - `fare_per_mile`
@@ -432,48 +331,60 @@ For every valid event, compute:
 - `pickup_hour`
 - `route_key`
 
-Publish enriched result to `clean_trip_events`.
+Publish result to `clean_trip_events`.
 
 ### 5. Anomaly Detection
 
-Run anomaly checks after validation and enrichment.
+Run anomaly checks after validation, enrichment, and derived fields.
 
 If anomaly is detected:
 
-- publish event to `clean_trip_events`
+- publish clean event to `clean_trip_events`
 - publish anomaly wrapper to `anomaly_events`
-- include event in metrics
+- update metric state from the clean event
 
 Do not send structurally valid anomalies to DLQ.
 
-### 6. Rolling Zone Demand Metrics
+### 6. Rolling Zone Metrics
 
-Maintain event-count window over last `N` valid clean events.
+Maintain a `deque(maxlen=ROLLING_WINDOW_SIZE)` of clean events.
 
-Use a `deque(maxlen=N)`.
+Compute:
 
-Compute top zones and zone-level averages from the current window.
+- pickup count by zone
+- demand rank
+- average fare by pickup zone
+- average distance by pickup zone
+- average duration by pickup zone
 
-Publish results to `zone_metrics`.
+Publish to `zone_metrics` at metric interval.
 
 ### 7. Route Profitability Metrics
 
-Maintain aggregate dictionaries keyed by route:
+Maintain route aggregates keyed by `route_key`:
 
-- count
-- revenue
-- distance
-- duration
-- tips
+- trip count
+- total revenue
+- total distance
+- total duration
+- total tips
 
-Compute route profitability at `LOG_INTERVAL` or metric interval.
+Compute:
 
-Publish top routes to `route_metrics`.
+- average revenue
+- revenue per mile
+- revenue per minute
+- average tip
+- profitability score
 
-### 8. Processing Summary
+Publish to `route_metrics` at metric interval.
 
-Print summary to console first:
+### 8. Consumer Health Summary
 
+Print:
+
+- source topic
+- output topics
 - total raw events seen
 - clean events produced
 - DLQ events produced
@@ -481,30 +392,18 @@ Print summary to console first:
 - top DLQ reasons
 - top anomaly reasons
 
-Optional later topic:
-
-```text
-consumer_health_metrics
-```
-
 ## Vertical Slices
-
-Implementation should be vertical, not horizontal. Each slice should deliver a working behavior from raw input to Kafka output.
-
-Do not first build all helpers, then all topics, then all metrics. Instead, ship one complete user-visible pipeline behavior at a time.
 
 ### Slice 1: DLQ for Impossible Records
 
-Goal: raw invalid event enters consumer and gets published to `dead_letter_events`.
-
 Scope:
 
-- add `KafkaProducer` to consumer
+- add `KafkaProducer`
 - configure output topic names via env vars
 - implement required field checks
 - implement impossible condition checks
 - publish structured DLQ event
-- exclude invalid event from current counters and metrics
+- exclude invalid event from counters and metrics
 
 Done when:
 
@@ -514,16 +413,15 @@ Done when:
 
 ### Slice 2: Zone-Enriched Clean Events
 
-Goal: valid raw event becomes enriched clean event.
-
 Scope:
-
-- load `taxi_zone_lookup.csv`
+- keep topic defaults initialized in `consumer.py`
+- use local `taxi_zone_lookup.csv` for enrichment
 - mount lookup file in Docker Compose if needed
 - map pickup and dropoff location IDs
 - reject unknown IDs to DLQ
 - compute derived trip fields
 - publish enriched event to `clean_trip_events`
+- leave anomaly routing and metric publishing for later slices
 
 Done when:
 
@@ -533,32 +431,28 @@ Done when:
 
 ### Slice 3: Anomaly Stream
 
-Goal: suspicious but valid clean event is copied to anomaly topic while still included in metrics.
-
 Scope:
 
 - implement anomaly rules
 - add severity and threshold metadata
 - publish anomaly wrapper to `anomaly_events`
 - keep event in `clean_trip_events`
-- keep event in rolling metrics
+- keep event eligible for metric state through `clean_trip_events`
 
 Done when:
 
 - high fare-per-mile event produces `clean_trip_events`
 - same event also produces `anomaly_events`
-- same event affects `zone_metrics` and `route_metrics`
+- event remains eligible for metric state through `clean_trip_events`
 - event does not go to `dead_letter_events`
 
 ### Slice 4: Rolling Zone Metrics
 
-Goal: consumer emits rolling demand metrics by pickup zone.
-
 Scope:
 
 - maintain last `N` valid clean events
-- compute top pickup zones
-- compute average fare, distance, duration by zone
+- use `clean_trip_events` as metric input if implemented downstream
+- compute zone counts and averages
 - publish `zone_metrics`
 
 Done when:
@@ -570,16 +464,11 @@ Done when:
 
 ### Slice 5: Route Profitability Metrics
 
-Goal: consumer emits ranked route metrics.
-
 Scope:
 
 - maintain route aggregates
-- compute revenue per mile
-- compute revenue per minute
-- compute average revenue
-- compute average tip
-- compute profitability score
+- use `clean_trip_events` as metric input if implemented downstream
+- compute route profitability fields
 - publish top routes to `route_metrics`
 
 Done when:
@@ -591,24 +480,18 @@ Done when:
 
 ### Slice 6: Consumer Health Summary
 
-Goal: make local debugging and demos easy.
-
 Scope:
 
-- print total raw events seen
-- print clean events produced
-- print DLQ events produced
-- print anomaly events produced
+- print raw, clean, DLQ, and anomaly counts
 - print top DLQ reasons
 - print top anomaly reasons
 - print output topic names at startup
 
 Done when:
 
-- running Docker Compose gives readable progress logs
-- logs explain where events were routed
+- Docker Compose logs show routing and topic progress clearly
 
-## Recommended Environment Variables
+## Environment Variables
 
 ```text
 SOURCE_TOPIC=taxi_trips_events
@@ -642,56 +525,4 @@ environment:
   PYTHONUNBUFFERED: "1"
 ```
 
-Kafka auto topic creation is currently enabled, so output topics can be created on first publish. Later, explicit topic creation is better for production-style setup.
-
-## Important Implementation Cautions
-
-Keep DLQ and anomaly logic separate.
-
-DLQ means unusable. Anomaly means usable but suspicious.
-
-Do not let invalid events update:
-
-- rolling zone window
-- route aggregates
-- average fare/distance/duration
-
-Do let anomaly events update metrics.
-
-Use stable keys when publishing:
-
-- `clean_trip_events`: key by `pu_location_id`
-- `dead_letter_events`: key by `event_id` if present, else fallback to raw Kafka offset or processing count
-- `anomaly_events`: key by `event_id`
-- `zone_metrics`: key by `pu_location_id`
-- `route_metrics`: key by `route_key`
-
-Do not hardcode only `TOPIC`; use named source/output topic constants.
-
-Make local parsing robust:
-
-- numeric parsing should distinguish missing/invalid from actual `0`
-- datetime parsing should handle ISO strings
-- avoid silently converting missing values to `0` during validation
-
-## Future Implementations
-
-After the core consumer topic routing is working:
-
-1. Event-time windows with watermark-like late event handling.
-2. Surge detection comparing current zone window to previous baseline.
-3. Storage writer consuming `clean_trip_events` into Parquet.
-4. DLQ monitor consuming `dead_letter_events`.
-5. Anomaly alert consumer for severe anomalies.
-6. Dashboard API consuming `zone_metrics` and `route_metrics`.
-7. Explicit Kafka topic creation and topic configs.
-8. Schema management using Avro or Protobuf.
-
-## Resume Framing
-
-Use this framing:
-
-```text
-Built a multi-topic real-time NYC taxi streaming analytics pipeline using Kafka and Python. Replayed historical TLC trip data into Kafka, validated and enriched events with taxi zone metadata, routed invalid records to a dead-letter stream, detected anomalous but valid trips, and emitted clean trip, zone demand, and route profitability topics for downstream storage, dashboards, and alerting.
-```
-
+Kafka auto topic creation is currently enabled, so output topics can be created on first publish.
