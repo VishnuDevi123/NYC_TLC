@@ -61,6 +61,7 @@ services:
     working_dir: /app
     volumes:
       - ./consumer:/app
+      - ./taxi_zone_lookup.csv:/app/taxi_zone_lookup.csv:ro
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       PYTHONUNBUFFERED: "1" 
