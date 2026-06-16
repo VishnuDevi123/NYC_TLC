@@ -439,7 +439,9 @@ def build_stats():
         "routes_tips": defaultdict(float),
     }
 
-
+# function for printing the health status of the consumer, 
+# including the number of events processed, sent to clean topic, 
+# sent to dlq, and sent to anomaly topic, as well as the top reasons for dlq and anomaly events,
 def print_health(stats):
     print("\n--- Consumer Health ---")
     print(f"Source topic: {SOURCE_TOPIC}")
